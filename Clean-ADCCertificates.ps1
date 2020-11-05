@@ -7,7 +7,7 @@ $text = @"
 `$Params = @{
     ManagementURL = "https://citrixadc.domain.local"
     Credential = Get-Credential -UserName "nsroot" -Message "Citrix ADC account"
-    Backup = $true
+    Backup = `$true
 }
 
 #Run function
