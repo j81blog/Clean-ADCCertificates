@@ -1,6 +1,8 @@
-. .\adcfunctions.ps1
-
 $text = @"
+
+#Load functions
+
+. .\adcfunctions.ps1
 
 #Specify the parameters
 
