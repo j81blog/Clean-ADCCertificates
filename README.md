@@ -1,4 +1,4 @@
-# Clean-ADCCertificates
+# Invoke-CleanADCCertificates
 Remotely cleanup old/unused certificates on a Citrix ADC.
 
 ```PowerShell
