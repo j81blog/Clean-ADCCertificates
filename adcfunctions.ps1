@@ -13,6 +13,9 @@ function Invoke-CleanADCCertificates {
     .PARAMETER noSaveConfig
         The configuration will be saved by default after all changes are made.
         Specify "-NoSaveConfig" to disable saving the configuration.
+    .PARAMETER ExpirationDays
+        If you have soon to be expired certificates (within 30 days) you will receive a warning message.
+        By specifying this parameter you can change the nr of days.
     .EXAMPLE
         $Credential = Get-Credential -UserName "nsroot" -Message "Citrix ADC account"
         Invoke-CleanADCCertificates -ManagementURL = "https://citrixadc.domain.local" -Credential $Credential
@@ -30,7 +33,7 @@ function Invoke-CleanADCCertificates {
         Invoke-CleanADCCertificates @Params
     .NOTES
         File Name : Invoke-CleanADCCertificates.ps1
-        Version   : v0.2
+        Version   : v0.3
         Author    : John Billekens
         Requires  : PowerShell v5.1 and up
                     ADC 11.x and up
@@ -43,13 +46,15 @@ function Invoke-CleanADCCertificates {
         [System.Uri]$ManagementURL,
 
         [parameter(Mandatory)]
-        [pscredential]$Credential,
+        [PSCredential]$Credential,
         
         [Switch]$Backup,
         
         [Switch]$NoSaveConfig,
         
-        [Int]$Attempts = 2        
+        [Int]$Attempts = 2,
+        
+        [Int]$ExpirationDays = 30       
     )
 
     #requires -version 5.1
@@ -63,17 +68,12 @@ function Invoke-CleanADCCertificates {
             
             [String[]]$ExcludedCertKey = @()
         )
-    
-        $InstalledCertificates = Invoke-GetADCSSLCertKey -ADCSession $Session | Expand-ADCResult | Where-Object { $_.certkey -notmatch '^ns-server-certificate$' } | Select-Object certkey, status, linkcertkeyname, serial, @{label = "cert"; expression = { "$($_.cert.Replace('/nsconfig/ssl/',''))" } }, @{label = "key"; expression = { "$($_.key.Replace('/nsconfig/ssl/',''))" } }
-        
+        $InstalledCertificates = Invoke-GetADCSSLCertKey -ADCSession $Session | Expand-ADCResult | Where-Object { $_.certkey -NotMatch '^ns-server-certificate$' } | Select-Object certkey, status, linkcertkeyname, serial, @{label = "daystoexpiration"; expression = { $_.daystoexpiration -as [int] } }, @{label = "cert"; expression = { "$($_.cert.Replace('/nsconfig/ssl/',''))" } }, @{label = "key"; expression = { "$($_.key.Replace('/nsconfig/ssl/',''))" } }
         $SSLFileLocation = "/nsconfig/ssl"
         $FileLocations = Invoke-GetADCSystemFileDirectories -FileLocation $SSLFileLocation
-        $CertificateFiles = $FileLocations | ForEach-Object { Invoke-GetADCSystemFile -FileLocation $_ -ADCSession $Session | Expand-ADCResult | Where-Object { ($_.filename -notmatch '^ns-root.*$|^ns-server.*$|^ns-sftrust.*$') -And ($_.filemode -ne "DIRECTORY") } }
-        
+        $CertificateFiles = $FileLocations | ForEach-Object { Invoke-GetADCSystemFile -FileLocation $_ -ADCSession $Session | Expand-ADCResult | Where-Object { ($_.filename -NotMatch '^ns-root.*$|^ns-server.*$|^ns-sftrust.*$') -And ($_.filemode -ne "DIRECTORY") } }
         $CertificateBindings = Invoke-GetADCSSLCertKeyBinding -ADCSession $Session | Expand-ADCResult
-        
         $LinkedCertificate = Invoke-GetADCSSLCertLink -ADCSession $Session | Expand-ADCResult
-        
         $Certificates = @()
         Foreach ($cert in $CertificateFiles) {
             $Removable = $true
@@ -82,8 +82,6 @@ function Invoke-CleanADCCertificates {
             $CertFileData = @()
             Foreach ($item in $certData) {
                 $Linked = $LinkedCertificate | Where-Object { $_.linkcertkeyname -eq $item.certkey } | Select-Object -ExpandProperty certkeyname
-                
-                
                 if ((($CertificateBindings | Where-Object { $_.certkey -eq $item.certkey } | Get-Member -MemberType NoteProperty | Where-Object Name -like "*binding").Name) -or ($Linked)) {
                     $CertFileData += $certData | Select-Object *, @{label = "bound"; expression = { $true } }, @{label = "linkedcertkey"; expression = { $Linked } }
                     $Removable = $false
@@ -102,11 +100,11 @@ function Invoke-CleanADCCertificates {
                 }
             }
             $Certificates += [PsCustomObject]@{
-                filename     = $cert.filename
-                filelocation = $cert.filelocation
-                certData     = $CertFileData
-                keyData      = $KeyFileData
-                removable    = $Removable
+                filename         = $cert.filename
+                filelocation     = $cert.filelocation
+                certData         = $CertFileData
+                keyData          = $KeyFileData
+                removable        = $Removable
             }
         }
         return $Certificates
@@ -260,16 +258,27 @@ function Invoke-CleanADCCertificates {
                     }
                 }
             } else {
-                Write-Host "`r`nNothing to remove (anymore), the location `"/nsconfig/ssl/`" is tidy!`r`n"
-                Break
+                Write-Host "`r`nNothing to remove (anymore), the location `"/nsconfig/ssl/`" is tidy!"
             }
-        
+
+            $Certs = Get-ADCCertificateRemoveInfo -Session $PriSession
             if ($($Certs | Where-Object { $_.certData.status -eq "Expired" }).count -gt 0) {
+                ""
                 Write-Warning "You still have EXPIRED certificates bound/active in the configuration!"
             }
-        
+
+            $ExpiringCerts = @($Certs | Where-Object { ($_.certData.daystoexpiration -in 0..$ExpirationDays) -and (-Not [String]::IsNullOrEmpty( $($_.certData.daystoexpiration) ) -and (-Not [String]::IsNullOrEmpty( $($_.certData.certkey) ) )) })
+            if ($ExpiringCerts.Count -gt 0) {
+                ""
+                Write-Warning "You have $($ExpiringCerts.Count) certificate(s) that will expire within $ExpirationDays days"
+
+                $ExpiringCerts |  ForEach-Object {
+                    Write-Warning "=> Days To Expiration: $($_.certData.daystoexpiration), CertKey: $($_.certData.certkey)"
+                }
+                ""
+            }
             if (-Not $NoSaveConfig) {
-                Write-Host -NoNewLine "Saving the config: "
+                Write-Host -NoNewLine "Saving the config.......: "
                 try {
                     $result = Invoke-SaveADCConfig -Session $ADCSession -ErrorAction Stop
                     Write-Host -ForeGroundColor Green "Done"
@@ -277,8 +286,6 @@ function Invoke-CleanADCCertificates {
                     Write-Host -ForeGroundColor Red "Failed"
                 }
             }
-        
-        
             Write-Host -ForeGroundColor Green "`r`nFinished!`r`n"
         } catch {
             Write-Host -ForeGroundColor Red "Caught an error. Exception Message: $($_.Exception.Message)"
@@ -311,7 +318,7 @@ function Connect-ADC {
         [System.Uri]$ManagementURL,
     
         [Parameter(Mandatory = $true)]
-        [pscredential]$Credential,
+        [PSCredential]$Credential,
     
         [int]$Timeout = 3600,
     
@@ -663,9 +670,9 @@ function Write-ADCText {
 function Invoke-CheckADCSession {
     <#
         .SYNOPSIS
-            Verify and retrieve an active sessionvariable
+            Verify and retrieve an active session variable
         .DESCRIPTION
-            Verify and retrieve an active sessionvariable
+            Verify and retrieve an active session variable
         .PARAMETER ADCSession
             Specify an active session (Output from Connect-ADC)
         .NOTES
@@ -723,7 +730,7 @@ function Invoke-GetADCHANode {
         [Switch]$Summary
     )
     try {
-        Write-Verbose "$($ADCSession | convertto-json -compress)"
+        Write-Verbose "$($ADCSession | ConvertTo-json -compress)"
         $response = Invoke-ADCRestApi -Session $ADCSession -Method GET -Type hanode -Filter $Filter -Summary:$Summary
     } catch {
         Write-Verbose "ERROR: $_.Exception.Message"
@@ -742,7 +749,7 @@ function Invoke-GetADCNSIP {
             Specify an active session (Output from Connect-ADC)
         .PARAMETER Filter
             Specify a filter
-            -Filter @{"type"="NSIP"}
+            -Filter @{"type"="nsip"}
         .PARAMETER Summary
             If specified a subset of info will be returned
         .EXAMPLE
